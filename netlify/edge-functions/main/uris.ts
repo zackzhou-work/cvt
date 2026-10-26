@@ -1,0 +1,1068 @@
+import type {
+  AnyNetwork,
+  AnyTLS,
+  GostPlugin,
+  HTTP,
+  Hysteria,
+  Hysteria2,
+  KcpTunPlugin,
+  Mieru,
+  ObfsPlugin,
+  Option,
+  PortOrPortRange,
+  PortOrPorts,
+  Proxy,
+  ProxyBase,
+  Reality,
+  RestlsPlugin,
+  ShadowTlsPlugin,
+  Socks5,
+  SS,
+  SSR,
+  Trojan,
+  TUIC,
+  V2rayPlugin,
+  VLESS,
+  VMess,
+  WireGuard,
+  XHTTPDownloadSettings,
+  XHTTPNetwork,
+  XHTTPReuseSettings,
+} from './types.ts'
+import {
+  createPure,
+  decodeBase64Url,
+  encodeBase64,
+  encodeBase64Url,
+  parseBool,
+  pickNonEmptyString,
+  pickNumber,
+  splitLeft,
+  splitRight,
+  urlDecode,
+  urlDecodePlus,
+} from './utils.ts'
+import { requireOldClashSupport } from './proxy_utils.ts'
+import {
+  DEFAULT_CLIENT_FINGERPRINT,
+  DEFAULT_GRPC_USER_AGENT,
+  DEFAULT_SCV,
+  DEFAULT_UDP,
+  TYPES_OLD_CLASH_SUPPORTED,
+} from './consts.ts'
+
+const FROM_URI = {
+  http(uri: string): HTTP {
+    const u = new URL(uri)
+    let { username, password } = u
+    if (!username && !password && !u.port) {
+      try {
+        const i = uri.indexOf('://') + 3
+        const s = splitRight(decodeBase64Url(uri.slice(i, i + u.hostname.length)), '@')
+        if (s.length === 2) {
+          ;[username, password] = splitLeft(s[0], ':')
+        }
+        u.host = s[s.length - 1]
+      } catch {
+        // pass
+      }
+    } else {
+      username = urlDecode(username)
+      password = urlDecode(password)
+    }
+    return {
+      ...baseFrom(u),
+      ...(username || password) && { username, password },
+      ...u.protocol === 'https:' && { tls: true, 'skip-cert-verify': DEFAULT_SCV },
+    }
+  },
+  socks5(uri: string): Socks5 {
+    const u = new URL(uri)
+    let { username, password } = u
+    if (!username && !password && !u.port) {
+      try {
+        const s = splitRight(decodeBase64Url(u.hostname), '@')
+        if (s.length === 2) {
+          ;[username, password] = splitLeft(s[0], ':')
+        }
+        u.host = s[s.length - 1]
+      } catch {
+        // pass
+      }
+    } else {
+      username = urlDecode(username)
+      password = urlDecode(password)
+    }
+    return {
+      ...baseFrom(u),
+      ...(username || password) && { username, password },
+      ...u.protocol === 'socks5+tls:' && { tls: true, 'skip-cert-verify': DEFAULT_SCV },
+      udp: DEFAULT_UDP,
+    }
+  },
+  ss(uri: string): SS {
+    const u = new URL(uri)
+    let cipher: string, password: string
+    if (u.username) {
+      ;[cipher, password] = u.password ? [u.username, u.password] : splitLeft(decodeBase64Url(u.username), ':')
+    } else {
+      const [userinfo, host] = splitRight(decodeBase64Url(u.host), '@')
+      u.host = host
+      ;[cipher, password] = splitLeft(userinfo, ':')
+    }
+    return {
+      ...baseFrom(u),
+      cipher,
+      password,
+      ...pluginFromSearchParam(u.searchParams.get('plugin')),
+      udp: DEFAULT_UDP,
+    }
+  },
+  ssr(uri: string): SSR {
+    const [ssr, params = ''] = splitLeft(decodeBase64Url(splitLeft(uri, '://')[1]), '/?')
+    const [server, port, protocol, cipher, obfs, password] = splitRight(ssr, ':', 5)
+    const { remarks, obfsparam, protoparam } = Object.fromEntries(
+      params.split('&').map((s) => splitLeft(s, '=')).map(([k, v]) => [k, decodeBase64Url(v)]),
+    )
+    return {
+      name: remarks || `${server}:${port}`,
+      server,
+      port: +port,
+      type: 'ssr',
+      cipher: cipher === 'none' ? 'dummy' : cipher,
+      password: decodeBase64Url(password),
+      obfs,
+      protocol,
+      ...obfsparam && { 'obfs-param': obfsparam },
+      ...protoparam && { 'protocol-param': protoparam },
+      udp: DEFAULT_UDP,
+    }
+  },
+  mieru(uri: string): Mieru {
+    const u = new URL(uri)
+    const ps = Object.fromEntries(u.searchParams)
+    const { protocol } = ps
+    return {
+      ...baseFromForPortRange(u),
+      username: urlDecode(u.username),
+      password: urlDecode(u.password),
+      transport: protocol,
+      ...pickNonEmptyString(ps, 'multiplexing', 'handshake-mode', 'traffic-pattern'),
+      udp: DEFAULT_UDP,
+    }
+  },
+  vmess(uri: string): VMess {
+    const j = JSON.parse(decodeBase64Url(splitLeft(uri, '://')[1]))
+    const { ps, add, port, id, aid, scy, net, tls, sni, alpn, fp } = j
+    const tlsOpts = tls === 'tls' || net === 'grpc' || net === 'h2'
+      ? {
+        tls: true,
+        ...sni && { servername: sni },
+        ...alpn && { alpn: alpn.split(',') },
+        'client-fingerprint': fp || DEFAULT_CLIENT_FINGERPRINT,
+        'skip-cert-verify': DEFAULT_SCV,
+      }
+      : {}
+    return {
+      name: ps || `${add}:${port}`,
+      server: add,
+      port: +port,
+      type: 'vmess',
+      uuid: id,
+      alterId: +aid || 0,
+      cipher: scy || 'auto',
+      ...networkFrom(j, 'ws', 'grpc', 'http', 'h2'),
+      ...tlsOpts,
+      udp: DEFAULT_UDP,
+      ...DEFAULT_UDP && { 'packet-encoding': 'xudp' },
+    }
+  },
+  vless(uri: string): VLESS {
+    const u = new URL(uri)
+    const ps = Object.fromEntries(u.searchParams)
+    const { flow, security, sni, alpn, fp, pcs, pbk, sid, type, encryption } = ps
+    const tlsOpts = security === 'tls' || security === 'reality' || type === 'grpc' || type === 'h2'
+      ? {
+        tls: true,
+        ...sni && { servername: sni },
+        ...alpn && { alpn: alpn.split(',') },
+        'client-fingerprint': fp || DEFAULT_CLIENT_FINGERPRINT,
+        ...pcs && { fingerprint: pcs },
+        ...realityFrom(pbk, sid),
+        'skip-cert-verify': DEFAULT_SCV,
+      }
+      : {}
+    return {
+      ...baseFrom(u),
+      uuid: urlDecode(u.username),
+      ...networkFrom(ps),
+      ...flow && { flow },
+      ...encryption && encryption !== 'none' && { encryption },
+      ...tlsOpts,
+      udp: DEFAULT_UDP,
+    }
+  },
+  trojan(uri: string): Trojan {
+    const u = new URL(uri)
+    const ps = Object.fromEntries(u.searchParams)
+    const netOpts = networkFrom(ps.ws === '1' ? { type: 'ws', host: ps.host, path: ps.wspath } : ps, 'ws', 'grpc')
+
+    const { sni, alpn, fp, pcs, pbk, sid, allowInsecure } = ps
+    return {
+      ...baseFrom(u),
+      password: urlDecode(u.username),
+      ...netOpts,
+      ...sni && { sni },
+      ...alpn && { alpn: alpn.split(',') },
+      'client-fingerprint': fp || DEFAULT_CLIENT_FINGERPRINT,
+      ...pcs && { fingerprint: pcs },
+      ...realityFrom(pbk, sid),
+      'skip-cert-verify': parseBool(allowInsecure) ?? DEFAULT_SCV,
+      udp: DEFAULT_UDP,
+    }
+  },
+  hysteria(uri: string): Hysteria {
+    const u = new URL(uri)
+    const ps = Object.fromEntries(u.searchParams)
+    const { protocol, auth, auth_str, peer, upmbps, downmbps, alpn, obfsParam, fastopen, insecure } = ps
+    return {
+      ...baseFrom(u),
+      ...(auth || auth_str) && { 'auth-str': auth || auth_str },
+      up: upmbps,
+      down: downmbps,
+      ...obfsParam && { obfs: obfsParam },
+      ...protocol && protocol !== 'udp' && { protocol },
+      ...peer && { sni: peer },
+      ...alpn && alpn !== 'hysteria' && { alpn: alpn.split(',') },
+      'skip-cert-verify': parseBool(insecure) ?? DEFAULT_SCV,
+      ...fastopen === '1' && { 'fast-open': true },
+    }
+  },
+  hysteria2(uri: string): Hysteria2 {
+    const u = new URL(uri)
+    const ps = Object.fromEntries(u.searchParams)
+    const { alpn, pinSHA256, insecure } = ps
+    return {
+      ...baseFromForPorts(u),
+      password: urlDecode(u.username),
+      ...pickNonEmptyString(ps, 'up', 'down', 'obfs', 'obfs-password', 'sni'),
+      ...alpn && { alpn: alpn.split(',') },
+      ...pinSHA256 && { fingerprint: pinSHA256 },
+      'skip-cert-verify': parseBool(insecure) ?? DEFAULT_SCV,
+    }
+  },
+  tuic(uri: string): TUIC {
+    const u = new URL(uri)
+    const ps = Object.fromEntries(u.searchParams)
+    const { alpn, sni, congestion_control } = ps
+    return {
+      ...baseFrom(u),
+      uuid: urlDecode(u.username),
+      password: urlDecode(u.password),
+      ...alpn && { alpn: alpn.split(',') },
+      ...sni && { sni },
+      ...congestion_control && { 'congestion-controller': congestion_control },
+      'skip-cert-verify': DEFAULT_SCV,
+    }
+  },
+  wireguard(uri: string): WireGuard {
+    const u = new URL(uri)
+    const ps = Object.fromEntries(u.searchParams)
+    const { publickey, reserved, address, mtu } = ps
+    const ips = Object.fromEntries(address.split(',').map((x) => [x.includes(':') ? 'ipv6' : 'ip', x]))
+    return {
+      ...baseFrom(u),
+      'private-key': urlDecode(u.username),
+      ...publickey && { 'public-key': publickey },
+      ...reserved && { reserved: reserved.split(',').map(Number) },
+      ...ips,
+      ...mtu && { mtu: +mtu },
+      udp: DEFAULT_UDP,
+    }
+  },
+  anytls(uri: string): AnyTLS {
+    const u = new URL(uri)
+    const ps = Object.fromEntries(u.searchParams)
+    const { alpn, hpkp, insecure } = ps
+    return {
+      ...baseFrom(u),
+      password: urlDecode(u.username),
+      ...pickNonEmptyString(ps, 'sni'),
+      ...alpn && { alpn: alpn.split(',') },
+      'client-fingerprint': DEFAULT_CLIENT_FINGERPRINT,
+      ...hpkp && { fingerprint: hpkp },
+      'skip-cert-verify': parseBool(insecure) ?? DEFAULT_SCV,
+      udp: DEFAULT_UDP,
+    }
+  },
+}
+
+const TO_URI = {
+  http(proxy: Proxy): string {
+    checkType(proxy, 'http')
+    const { name, server, port, username, password, tls } = proxy
+    const auth = (username || password ? `${username}:${password}@` : '') +
+      `${server.includes(':') ? `[${server}]` : server}:${port}`
+    return `${tls ? 'https' : 'http'}://${encodeBase64Url(auth)}?${new URLSearchParams({ remarks: name })}`
+  },
+  socks5(proxy: Proxy): string {
+    checkType(proxy, 'socks5')
+    const { name, server, port, username, password } = proxy
+    const auth = (username || password ? `${username}:${password}@` : '') +
+      `${server.includes(':') ? `[${server}]` : server}:${port}`
+    const u = new URL(`socks://${encodeBase64Url(auth)}`)
+    u.hash = name.replaceAll('%', '%25')
+    return u.href
+  },
+  ss(proxy: Proxy): string {
+    checkType(proxy, 'ss')
+    const { cipher, password } = proxy
+    const u = baseTo(proxy)
+    u.username = encodeBase64Url(`${cipher}:${password}`)
+    const plugin = pluginToSearchParam(proxy)
+    if (plugin) {
+      u.pathname = '/'
+      u.searchParams.set('plugin', plugin)
+    }
+    return u.href
+  },
+  ssr(proxy: Proxy): string {
+    checkType(proxy, 'ssr')
+    const {
+      name,
+      type,
+      server,
+      port,
+      cipher,
+      password,
+      obfs,
+      protocol,
+      'obfs-param': obfsparam,
+      'protocol-param': protoparam,
+    } = proxy
+    const ssr = [
+      server,
+      port,
+      protocol,
+      cipher === 'dummy' ? 'none' : cipher,
+      obfs,
+      encodeBase64Url(password),
+    ].join(':')
+    const params = [['remarks', name], ['obfsparam', obfsparam], ['protoparam', protoparam]]
+      .filter(([, v]) => v)
+      .map(([k, v]) => `${k}=${encodeBase64Url(v!)}`)
+      .join('&')
+    return `${type}://` + encodeBase64Url(`${ssr}/?${params}`)
+  },
+  mieru(proxy: Proxy): string {
+    checkType(proxy, 'mieru')
+    const { name, server, username, password, transport } = proxy
+    const u = new URL(`mierus://${server.includes(':') ? `[${server}]` : server}`)
+    u.hash = name.replaceAll('%', '%25')
+    u.username = username
+    u.password = password
+    u.search = new URLSearchParams({
+      port: 'port' in proxy ? String(proxy.port) : proxy['port-range'],
+      protocol: transport,
+      ...pickNonEmptyString(proxy, 'multiplexing', 'handshake-mode', 'traffic-pattern'),
+    }).toString()
+    return u.href
+  },
+  vmess(proxy: Proxy): string {
+    checkType(proxy, 'vmess')
+    const { name, type, server, port, uuid, alterId, cipher, tls, servername, alpn, 'client-fingerprint': fp } = proxy
+    return `${type}://` + encodeBase64(JSON.stringify({
+      v: '2',
+      ps: name,
+      add: server,
+      port: String(port),
+      id: uuid,
+      ...alterId && { aid: String(alterId) },
+      ...cipher !== 'auto' && { scy: cipher },
+      ...networkTo(proxy),
+      ...tls && {
+        tls: 'tls',
+        ...servername && { sni: servername },
+        ...alpn?.length && { alpn: alpn.join(',') },
+        ...fp && { fp },
+      },
+    }))
+  },
+  vless(proxy: Proxy): string {
+    checkType(proxy, 'vless')
+    const { uuid, flow, encryption, tls, servername, alpn, 'client-fingerprint': fp, fingerprint } = proxy
+    const u = baseTo(proxy)
+    u.username = uuid
+    u.search = new URLSearchParams({
+      ...networkToStd(proxy),
+      ...flow && { flow },
+      ...encryption && { encryption },
+      ...tls && {
+        ...realityTo(proxy, { security: 'tls' }),
+        ...servername && { sni: servername },
+        ...alpn?.length && { alpn: alpn.join(',') },
+        ...fp && { fp },
+        ...fingerprint && { pcs: fingerprint },
+      },
+    }).toString()
+    return u.href
+  },
+  trojan(proxy: Proxy): string {
+    checkType(proxy, 'trojan')
+    const { password, sni, alpn, 'client-fingerprint': fp, fingerprint, 'skip-cert-verify': scv } = proxy
+    const u = baseTo(proxy)
+    u.username = password
+    u.search = new URLSearchParams({
+      ...networkToStd(proxy),
+      ...realityTo(proxy),
+      ...sni && { sni },
+      ...alpn?.length && { alpn: alpn.join(',') },
+      ...fp && { fp },
+      ...fingerprint && { pcs: fingerprint },
+      allowInsecure: scv ? '1' : '0',
+    }).toString()
+    return u.href
+  },
+  hysteria(proxy: Proxy): string {
+    checkType(proxy, 'hysteria')
+    const { 'auth-str': auth, up, down, obfs, protocol, sni, alpn, 'skip-cert-verify': scv, 'fast-open': fastopen } =
+      proxy
+    const u = baseTo(proxy)
+    u.search = new URLSearchParams({
+      ...protocol && { protocol },
+      ...auth && { auth },
+      ...sni && { peer: sni },
+      upmbps: toMbps(up),
+      downmbps: toMbps(down),
+      ...alpn?.length && { alpn: alpn.join(',') },
+      insecure: scv ? '1' : '0',
+      ...obfs && { obfs: 'xplus', obfsParam: obfs },
+      ...fastopen && { fastopen: '1' },
+    }).toString()
+    return u.href
+  },
+  hysteria2(proxy: Proxy): string {
+    checkType(proxy, 'hysteria2')
+    const { ports, password, up, down, alpn, fingerprint, 'skip-cert-verify': scv } = proxy
+    const u = baseTo(proxy)
+    u.username = password
+    u.search = new URLSearchParams({
+      ...ports && { mport: ports },
+      ...up && { up: toMbps(up) },
+      ...down && { down: toMbps(down) },
+      ...pickNonEmptyString(proxy, 'obfs', 'obfs-password', 'sni'),
+      ...alpn?.length && { alpn: alpn.join(',') },
+      ...fingerprint && { pinSHA256: fingerprint },
+      insecure: scv ? '1' : '0',
+    }).toString()
+    return u.href
+  },
+  tuic(proxy: Proxy): string {
+    checkType(proxy, 'tuic')
+    const { uuid, password, 'congestion-controller': cc, alpn, sni } = proxy
+    const u = baseTo(proxy)
+    u.username = uuid || ''
+    u.password = password || ''
+    u.search = new URLSearchParams({
+      ...alpn?.length && { alpn: alpn.join(',') },
+      ...sni && { sni },
+      ...cc && { congestion_control: cc },
+    }).toString()
+    return u.href
+  },
+  wireguard(proxy: Proxy): string {
+    checkType(proxy, 'wireguard')
+    const { 'private-key': privatekey, 'public-key': publickey, reserved, ip, ipv6, mtu } = proxy
+    const u = baseTo(proxy)
+    u.username = privatekey
+    u.search = new URLSearchParams({
+      ...publickey && { publickey },
+      ...reserved && { reserved: reserved.join(',') },
+      address: [ip, ipv6].filter((x) => x).join(','),
+      ...mtu && { mtu: String(mtu) },
+    }).toString()
+    return u.href
+  },
+  anytls(proxy: Proxy): string {
+    checkType(proxy, 'anytls')
+    const { password, alpn, fingerprint, 'skip-cert-verify': scv } = proxy
+    const u = baseTo(proxy)
+    u.username = password
+    u.search = new URLSearchParams({
+      ...pickNonEmptyString(proxy, 'sni'),
+      ...alpn?.length && { alpn: alpn.join(',') },
+      ...fingerprint && { hpkp: fingerprint },
+      insecure: scv ? '1' : '0',
+    }).toString()
+    return u.href
+  },
+}
+
+function checkType<T extends Proxy['type']>(proxy: Proxy, type: T): asserts proxy is Proxy & { type: T } {
+  if (proxy.type !== type) throw Error(`Proxy type is not ${type}: ${proxy.type}`)
+}
+
+function baseFrom<T extends Proxy['type']>(u: URL): ProxyBase & { port: number; type: T } {
+  const { protocol, hostname, port, host, hash } = u
+  return {
+    name: u.searchParams.get('remarks') || hash && urlDecodePlus(hash.substring(1)) || host,
+    server: hostname[0] === '[' ? hostname.slice(1, -1) : hostname,
+    port: +port || (protocol === 'http:' ? 80 : 443),
+    type: TYPE_MAP[protocol.slice(0, -1)] as T,
+  }
+}
+
+function baseFromForPorts<T extends Proxy['type']>(u: URL): ProxyBase & PortOrPorts & { type: T } {
+  const { protocol, hostname, port, host, hash } = u
+  const mport = u.searchParams.get('mport')
+  const ports = {
+    ...port && { port: +port },
+    ...mport && { ports: mport },
+  }
+  if (!('port' in ports || 'ports' in ports)) {
+    ports.port = protocol === 'http:' ? 80 : 443
+  }
+  return {
+    name: u.searchParams.get('remarks') || hash && urlDecodePlus(hash.substring(1)) || host,
+    server: hostname[0] === '[' ? hostname.slice(1, -1) : hostname,
+    ...ports as PortOrPorts,
+    type: TYPE_MAP[protocol.slice(0, -1)] as T,
+  }
+}
+
+function baseFromForPortRange<T extends Proxy['type']>(u: URL): ProxyBase & PortOrPortRange & { type: T } {
+  const { protocol, hostname, hash } = u
+  const port = u.searchParams.get('port') ?? ''
+  return {
+    name: u.searchParams.get('remarks') || hash && urlDecodePlus(hash.substring(1)) || u.searchParams.get('profile') ||
+      `${hostname}:${port}`,
+    server: hostname[0] === '[' ? hostname.slice(1, -1) : hostname,
+    ...port.includes('-') ? { 'port-range': port } : { port: +port },
+    type: TYPE_MAP[protocol.slice(0, -1)] as T,
+  }
+}
+
+function baseTo(p: ProxyBase & Pick<Proxy, 'type'> & { port?: number }): URL {
+  const { name, type, server, port } = p
+  const u = new URL(`${type}://${server.includes(':') ? `[${server}]` : server}`)
+  if (port) u.port = String(port)
+  u.hash = name.replaceAll('%', '%25')
+  return u
+}
+
+function pluginFromSearchParam(p: string | null): Option<ObfsPlugin | V2rayPlugin | GostPlugin | ShadowTlsPlugin> {
+  if (!p) return {}
+  const [plugin, ...strOpts] = p.split(';')
+  const opts: Record<string, string | undefined> = Object.fromEntries(strOpts.map((s) => splitLeft(s, '=')))
+  switch (plugin) {
+    case 'simple-obfs':
+    case 'obfs-local': {
+      const host = opts['obfs-host']
+      return {
+        plugin: 'obfs',
+        'plugin-opts': {
+          mode: opts.obfs,
+          ...host && { host },
+        },
+      } as ObfsPlugin
+    }
+    case 'v2ray-plugin':
+      return {
+        plugin,
+        'plugin-opts': {
+          ...pickNonEmptyString(opts, 'mode', 'host', 'path'),
+          ...'tls' in opts && {
+            tls: true,
+            'skip-cert-verify': DEFAULT_SCV,
+          },
+          ...!('mux' in opts) && { mux: false },
+        },
+      } as V2rayPlugin
+    case 'gost-plugin':
+      return {
+        plugin,
+        'plugin-opts': {
+          ...pickNonEmptyString(opts, 'mode', 'host', 'path'),
+          ...'tls' in opts && {
+            tls: true,
+            'skip-cert-verify': DEFAULT_SCV,
+          },
+          ...!('mux' in opts) && { mux: false },
+        },
+      } as GostPlugin
+    case 'shadow-tls':
+      return {
+        plugin,
+        'client-fingerprint': DEFAULT_CLIENT_FINGERPRINT,
+        'plugin-opts': {
+          host: opts.host || '',
+          ...pickNonEmptyString(opts, 'password'),
+          ...pickNumber(opts, 'version'),
+          ...opts.alpn && { alpn: opts.alpn.split(',') },
+          'skip-cert-verify': DEFAULT_SCV,
+        },
+      }
+  }
+  throw new Error(`Unsupported plugin: ${plugin}`)
+}
+
+function pluginToSearchParam(
+  p: Option<ObfsPlugin | V2rayPlugin | GostPlugin | ShadowTlsPlugin | RestlsPlugin | KcpTunPlugin>,
+): string {
+  const { plugin, 'plugin-opts': opts } = p
+  if (!plugin) return ''
+  switch (plugin) {
+    case 'obfs': {
+      const { mode, host } = opts
+      return `obfs-local;obfs=${mode}${host ? `;obfs-host=${host}` : ''}`
+    }
+    case 'v2ray-plugin':
+    case 'gost-plugin': {
+      const { mode, host, path, tls, mux } = opts
+      return `${plugin};mode=${mode}${tls ? ';tls' : ''}${mux !== false ? ';mux=4' : ''}${
+        host ? `;host=${host}` : ''
+      }${path ? `;path=${path}` : ''}`
+    }
+    case 'shadow-tls': {
+      const { host, password, version, alpn } = opts
+      return `${plugin};host=${host}${password ? `;password=${password}` : ''}${version ? `;version=${version}` : ''}${
+        alpn?.length ? `;alpn=${alpn}` : ''
+      }`
+    }
+  }
+  throw new Error(`Unsupported plugin: ${plugin}`)
+}
+
+type NetworkName = AnyNetwork['network']
+type NetworkResult<S extends readonly NetworkName[]> = Option<
+  S extends readonly [] ? AnyNetwork : Extract<AnyNetwork, { network: S[number] }>
+>
+
+function networkFrom<S extends readonly NetworkName[]>(
+  ps: Record<string, string>,
+  ...supported: S
+): NetworkResult<S> {
+  let { net, type, headerType, host, path, serviceName } = ps
+  const network = (headerType || type) === 'http' ? 'http' : (net || type)
+  if (!network) return {}
+  const hosts = host ? host.split(',') : []
+  path ||= '/'
+  switch (network) {
+    case 'tcp':
+      return {}
+    case 'ws':
+    case 'httpupgrade': {
+      if (supported.length !== 0 && !supported.includes('ws')) return {}
+      return {
+        network: 'ws',
+        'ws-opts': {
+          path,
+          ...hosts.length && { headers: { Host: hosts[0] } },
+          ...network === 'httpupgrade' && { 'v2ray-http-upgrade': true },
+        },
+      } as NetworkResult<S>
+    }
+    case 'grpc': {
+      if (supported.length !== 0 && !supported.includes('grpc')) return {}
+      return {
+        network,
+        'grpc-opts': {
+          'grpc-service-name': serviceName || path,
+          'grpc-user-agent': DEFAULT_GRPC_USER_AGENT,
+        },
+      } as NetworkResult<S>
+    }
+    case 'http': {
+      if (supported.length !== 0 && !supported.includes('http')) return {}
+      return {
+        network,
+        'http-opts': {
+          path: [path],
+          ...hosts.length && { headers: { Host: hosts } },
+        },
+      } as NetworkResult<S>
+    }
+    case 'h2': {
+      if (supported.length !== 0 && !supported.includes('h2')) return {}
+      return {
+        network,
+        'h2-opts': {
+          path,
+          ...hosts.length && { host: hosts },
+        },
+      } as NetworkResult<S>
+    }
+    case 'xhttp': {
+      if (supported.length !== 0 && !supported.includes('xhttp')) return {}
+      return {
+        network,
+        'xhttp-opts': {
+          ...pickNonEmptyString(ps, 'path', 'host', 'mode'),
+          ...parseXHTTPExtra(ps),
+        },
+      } as NetworkResult<S>
+    }
+  }
+  return {}
+}
+
+function isRecord(o: unknown): o is Record<string, unknown> {
+  return typeof o === 'object' && o !== null
+}
+
+function reuseFrom(ps: { xmux?: unknown }): Pick<NonNullable<XHTTPNetwork['xhttp-opts']>, 'reuse-settings'> {
+  const x = ps.xmux
+  if (!isRecord(x)) return {}
+  const rs: XHTTPReuseSettings = {
+    ...!!x.maxConnections && { 'max-connections': String(x.maxConnections) },
+    ...!!x.maxConcurrency && { 'max-concurrency': String(x.maxConcurrency) },
+    ...!!x.cMaxReuseTimes && { 'c-max-reuse-times': String(x.cMaxReuseTimes) },
+    ...!!x.hMaxRequestTimes && { 'h-max-request-times': String(x.hMaxRequestTimes) },
+    ...!!x.hMaxReusableSecs && { 'h-max-reusable-secs': String(x.hMaxReusableSecs) },
+    ...!!x.hKeepAlivePeriod && { 'h-keep-alive-period': Number(x.hKeepAlivePeriod) },
+  }
+  return Object.keys(rs).length ? { 'reuse-settings': rs } : {}
+}
+
+function parseXHTTPExtra(
+  ps: { extra?: string },
+): Pick<
+  NonNullable<XHTTPNetwork['xhttp-opts']>,
+  'no-grpc-header' | 'x-padding-bytes' | 'reuse-settings' | 'download-settings'
+> {
+  if (!ps.extra) return {}
+  const j = JSON.parse(ps.extra)
+  const ds: XHTTPDownloadSettings = {}
+  if (j.downloadSettings) {
+    const { xhttpSettings } = j.downloadSettings
+    if (xhttpSettings) {
+      Object.assign(ds, pickNonEmptyString(xhttpSettings, 'path', 'host'))
+      if (isRecord(xhttpSettings.headers) && Object.keys(xhttpSettings.headers).length) {
+        ds.headers = xhttpSettings.headers
+      }
+      if (xhttpSettings.noGrpcHeader) ds['no-grpc-header'] = true
+      if (xhttpSettings.xPaddingBytes) ds['x-padding-bytes'] = String(xhttpSettings.xPaddingBytes)
+      if (xhttpSettings.xPaddingObfsMode) ds['x-padding-obfs-mode'] = !!xhttpSettings.xPaddingObfsMode
+      if (xhttpSettings.xPaddingKey) ds['x-padding-key'] = String(xhttpSettings.xPaddingKey)
+      if (xhttpSettings.xPaddingHeader) ds['x-padding-header'] = String(xhttpSettings.xPaddingHeader)
+      if (xhttpSettings.xPaddingPlacement) ds['x-padding-placement'] = String(xhttpSettings.xPaddingPlacement)
+      if (xhttpSettings.xPaddingMethod) ds['x-padding-method'] = String(xhttpSettings.xPaddingMethod)
+      if (xhttpSettings.uplinkHttpMethod) ds['uplink-http-method'] = String(xhttpSettings.uplinkHttpMethod)
+      if (xhttpSettings.sessionPlacement) ds['session-placement'] = String(xhttpSettings.sessionPlacement)
+      if (xhttpSettings.sessionKey) ds['session-key'] = String(xhttpSettings.sessionKey)
+      if (xhttpSettings.seqPlacement) ds['seq-placement'] = String(xhttpSettings.seqPlacement)
+      if (xhttpSettings.seqKey) ds['seq-key'] = String(xhttpSettings.seqKey)
+      if (xhttpSettings.uplinkDataPlacement) ds['uplink-data-placement'] = String(xhttpSettings.uplinkDataPlacement)
+      if (xhttpSettings.uplinkDataKey) ds['uplink-data-key'] = String(xhttpSettings.uplinkDataKey)
+      if (xhttpSettings.uplinkChunkSize) ds['uplink-chunk-size'] = String(xhttpSettings.uplinkChunkSize)
+      if (xhttpSettings.scMaxEachPostBytes) ds['sc-max-each-post-bytes'] = String(xhttpSettings.scMaxEachPostBytes)
+      if (xhttpSettings.scMinPostsIntervalMs) {
+        ds['sc-min-posts-interval-ms'] = String(xhttpSettings.scMinPostsIntervalMs)
+      }
+      if (xhttpSettings.extra) Object.assign(ds, reuseFrom(xhttpSettings.extra))
+    }
+    if (j.downloadSettings.address) ds.server = String(j.downloadSettings.address)
+    if (j.downloadSettings.port) ds.port = Number(j.downloadSettings.port)
+    const sec = String(j.downloadSettings.security).toLowerCase()
+    if (sec === 'tls' || sec === 'reality') {
+      ds.tls = true
+      ds['client-fingerprint'] = DEFAULT_CLIENT_FINGERPRINT
+      const { tlsSettings } = j.downloadSettings
+      if (tlsSettings) {
+        if (tlsSettings.serverName) ds.servername = String(tlsSettings.serverName)
+        if (tlsSettings.fingerprint) ds['client-fingerprint'] = String(tlsSettings.fingerprint)
+        if (Array.isArray(tlsSettings.alpn)) ds.alpn = tlsSettings.alpn
+      }
+      if (sec === 'reality') {
+        const { realitySettings } = j.downloadSettings
+        if (realitySettings) {
+          Object.assign(ds, realityFrom(realitySettings.publicKey, realitySettings.shortId))
+        }
+      }
+      ds['skip-cert-verify'] = DEFAULT_SCV
+    }
+  }
+  return {
+    ...j.noGRPCHeaders && { 'no-grpc-header': true },
+    ...j.xPaddingBytes && { 'x-padding-bytes': String(j.xPaddingBytes) },
+    ...j.xPaddingObfsMode && { 'x-padding-obfs-mode': true },
+    ...(j.xPaddingKey && { 'x-padding-key': String(j.xPaddingKey) }),
+    ...(j.xPaddingHeader && { 'x-padding-header': String(j.xPaddingHeader) }),
+    ...(j.xPaddingPlacement && { 'x-padding-placement': String(j.xPaddingPlacement) }),
+    ...(j.xPaddingMethod && { 'x-padding-method': String(j.xPaddingMethod) }),
+    ...(j.uplinkHttpMethod && { 'uplink-http-method': String(j.uplinkHttpMethod) }),
+    ...(j.sessionPlacement && { 'session-placement': String(j.sessionPlacement) }),
+    ...(j.sessionKey && { 'session-key': String(j.sessionKey) }),
+    ...(j.seqPlacement && { 'seq-placement': String(j.seqPlacement) }),
+    ...(j.seqKey && { 'seq-key': String(j.seqKey) }),
+    ...(j.uplinkDataPlacement && { 'uplink-data-placement': String(j.uplinkDataPlacement) }),
+    ...(j.uplinkDataKey && { 'uplink-data-key': String(j.uplinkDataKey) }),
+    ...(j.uplinkChunkSize && { 'uplink-chunk-size': String(j.uplinkChunkSize) }),
+    ...(j.scMaxEachPostBytes && { 'sc-max-each-post-bytes': String(j.scMaxEachPostBytes) }),
+    ...(j.scMinPostsIntervalMs && { 'sc-min-posts-interval-ms': String(j.scMinPostsIntervalMs) }),
+    ...reuseFrom(j),
+    ...Object.keys(ds).length && { 'download-settings': ds },
+  }
+}
+
+function networkTo(
+  netOpts: Option<AnyNetwork>,
+  kNet = 'net',
+  kType = 'type',
+  kServiceName = 'path',
+) {
+  const net = netOpts.network
+  if (!net) return {}
+  switch (net) {
+    case 'ws': {
+      const { path, headers, 'v2ray-http-upgrade': httpupgrade } = netOpts['ws-opts'] || {}
+      return {
+        [kNet]: httpupgrade ? 'httpupgrade' : net,
+        ...headers?.Host && { host: headers.Host },
+        ...path && { path },
+      }
+    }
+    case 'grpc':
+      return {
+        [kNet]: net,
+        ...netOpts['grpc-opts'] && { [kServiceName]: netOpts['grpc-opts']['grpc-service-name'] },
+      }
+    case 'http': {
+      const { path, headers } = netOpts['http-opts'] || {}
+      return {
+        [kNet]: 'tcp',
+        [kType]: 'http',
+        ...headers?.Host?.length && { host: headers.Host.join(',') },
+        ...path?.length && { path: path[0] },
+      }
+    }
+    case 'h2': {
+      const { path, host } = netOpts['h2-opts'] || {}
+      return {
+        [kNet]: net,
+        ...host?.length && { host: host.join(',') },
+        ...path && { path },
+      }
+    }
+    case 'xhttp': {
+      const opts = netOpts['xhttp-opts'] || {}
+      return {
+        [kNet]: net,
+        ...pickNonEmptyString(opts, 'path', 'host', 'mode'),
+        ...stringifyXHTTPExtra(opts),
+      }
+    }
+  }
+}
+
+function reuseTo(o: Pick<NonNullable<XHTTPNetwork['xhttp-opts']>, 'reuse-settings'>): { xmux?: unknown } {
+  const rs = o['reuse-settings']
+  if (rs) {
+    const xmux = {
+      ...rs['max-connections'] && { maxConnections: rs['max-connections'] },
+      ...rs['max-concurrency'] && { maxConcurrency: rs['max-concurrency'] },
+      ...rs['c-max-reuse-times'] && { cMaxReuseTimes: rs['c-max-reuse-times'] },
+      ...rs['h-max-request-times'] && { hMaxRequestTimes: rs['h-max-request-times'] },
+      ...rs['h-max-reusable-secs'] && { hMaxReusableSecs: rs['h-max-reusable-secs'] },
+      ...rs['h-keep-alive-period'] && { hKeepAlivePeriod: rs['h-keep-alive-period'] },
+    }
+    if (Object.keys(xmux).length) return { xmux }
+  }
+  return {}
+}
+
+function stringifyXHTTPExtra(
+  o: Pick<
+    NonNullable<XHTTPNetwork['xhttp-opts']>,
+    | 'no-grpc-header'
+    | 'x-padding-bytes'
+    | 'x-padding-obfs-mode'
+    | 'x-padding-key'
+    | 'x-padding-header'
+    | 'x-padding-placement'
+    | 'x-padding-method'
+    | 'uplink-http-method'
+    | 'session-placement'
+    | 'session-key'
+    | 'seq-placement'
+    | 'seq-key'
+    | 'uplink-data-placement'
+    | 'uplink-data-key'
+    | 'uplink-chunk-size'
+    | 'sc-max-each-post-bytes'
+    | 'sc-min-posts-interval-ms'
+    | 'reuse-settings'
+    | 'download-settings'
+  >,
+): { extra?: string } {
+  const extra: Record<string, unknown> = {}
+
+  if (o['no-grpc-header']) extra.noGRPCHeaders = true
+  if (o['x-padding-bytes']) extra.xPaddingBytes = o['x-padding-bytes']
+  if (o['x-padding-obfs-mode']) extra.xPaddingObfsMode = true
+  if (o['x-padding-key']) extra.xPaddingKey = o['x-padding-key']
+  if (o['x-padding-header']) extra.xPaddingHeader = o['x-padding-header']
+  if (o['x-padding-placement']) extra.xPaddingPlacement = o['x-padding-placement']
+  if (o['x-padding-method']) extra.xPaddingMethod = o['x-padding-method']
+  if (o['uplink-http-method']) extra.uplinkHttpMethod = o['uplink-http-method']
+  if (o['session-placement']) extra.sessionPlacement = o['session-placement']
+  if (o['session-key']) extra.sessionKey = o['session-key']
+  if (o['seq-placement']) extra.seqPlacement = o['seq-placement']
+  if (o['seq-key']) extra.seqKey = o['seq-key']
+  if (o['uplink-data-placement']) extra.uplinkDataPlacement = o['uplink-data-placement']
+  if (o['uplink-data-key']) extra.uplinkDataKey = o['uplink-data-key']
+  if (o['uplink-chunk-size']) extra.uplinkChunkSize = o['uplink-chunk-size']
+  if (o['sc-max-each-post-bytes']) extra.scMaxEachPostBytes = o['sc-max-each-post-bytes']
+  if (o['sc-min-posts-interval-ms']) extra.scMinPostsIntervalMs = o['sc-min-posts-interval-ms']
+  Object.assign(extra, reuseTo(o))
+
+  const ds = o['download-settings']
+  if (ds) {
+    const downloadSettings: Record<string, unknown> = {}
+
+    const xhttpSettings: Record<string, unknown> = {}
+    Object.assign(xhttpSettings, pickNonEmptyString(ds, 'path', 'host'))
+    if (ds.headers) xhttpSettings.headers = ds.headers
+    if (ds['no-grpc-header']) xhttpSettings.noGrpcHeader = true
+    if (ds['x-padding-bytes']) xhttpSettings.xPaddingBytes = ds['x-padding-bytes']
+    if (ds['x-padding-obfs-mode']) xhttpSettings.xPaddingObfsMode = true
+    if (ds['x-padding-key']) xhttpSettings.xPaddingKey = ds['x-padding-key']
+    if (ds['x-padding-header']) xhttpSettings.xPaddingHeader = ds['x-padding-header']
+    if (ds['x-padding-placement']) xhttpSettings.xPaddingPlacement = ds['x-padding-placement']
+    if (ds['x-padding-method']) xhttpSettings.xPaddingMethod = ds['x-padding-method']
+    if (ds['uplink-http-method']) xhttpSettings.uplinkHttpMethod = ds['uplink-http-method']
+    if (ds['session-placement']) xhttpSettings.sessionPlacement = ds['session-placement']
+    if (ds['session-key']) xhttpSettings.sessionKey = ds['session-key']
+    if (ds['seq-placement']) xhttpSettings.seqPlacement = ds['seq-placement']
+    if (ds['seq-key']) xhttpSettings.seqKey = ds['seq-key']
+    if (ds['uplink-data-placement']) xhttpSettings.uplinkDataPlacement = ds['uplink-data-placement']
+    if (ds['uplink-data-key']) xhttpSettings.uplinkDataKey = ds['uplink-data-key']
+    if (ds['uplink-chunk-size']) xhttpSettings.uplinkChunkSize = ds['uplink-chunk-size']
+    if (ds['sc-max-each-post-bytes']) xhttpSettings.scMaxEachPostBytes = ds['sc-max-each-post-bytes']
+    if (ds['sc-min-posts-interval-ms']) xhttpSettings.scMinPostsIntervalMs = ds['sc-min-posts-interval-ms']
+    const xmux = reuseTo(ds)
+    if (Object.keys(xmux).length) xhttpSettings.extra = xmux
+    if (Object.keys(xhttpSettings).length) downloadSettings.xhttpSettings = xhttpSettings
+
+    if (ds.server) downloadSettings.address = ds.server
+    if (ds.port) downloadSettings.port = ds.port
+
+    if (ds.tls) {
+      downloadSettings.security = ds['reality-opts'] ? 'reality' : 'tls'
+      const tlsSettings: Record<string, unknown> = {}
+      if (ds.servername) tlsSettings.serverName = ds.servername
+      if (ds['client-fingerprint']) tlsSettings.fingerprint = ds['client-fingerprint']
+      if (ds.alpn) tlsSettings.alpn = ds.alpn
+      if (Object.keys(tlsSettings).length) downloadSettings.tlsSettings = tlsSettings
+      if (ds['reality-opts']) {
+        downloadSettings.realitySettings = {
+          publicKey: ds['reality-opts']['public-key'],
+          shortId: ds['reality-opts']['short-id'],
+        }
+      }
+    }
+
+    if (Object.keys(downloadSettings).length) extra.downloadSettings = downloadSettings
+  }
+
+  return Object.keys(extra).length ? { extra: JSON.stringify(extra) } : {}
+}
+
+function networkToStd(netOpts: Option<AnyNetwork>) {
+  return networkTo(netOpts, 'type', 'headerType', 'serviceName')
+}
+
+function realityFrom(pbk: string, sid?: string): Option<Reality> {
+  if (!pbk) return {}
+  return {
+    'reality-opts': {
+      'public-key': pbk,
+      'short-id': sid || '',
+    },
+  }
+}
+
+function realityTo<R extends Record<string, string>>(
+  opts: Option<Reality>,
+  defaultValue?: R,
+): { security?: 'reality'; pbk?: string; sid?: string } | R {
+  const realityOpts = opts['reality-opts']
+  if (!realityOpts) return defaultValue || {}
+  const { 'public-key': pbk, 'short-id': sid } = realityOpts
+  return { security: 'reality', pbk, sid }
+}
+
+function toMbps(s: string): string {
+  const m = s.match(/^(\d+)\s*([KMGT])?([Bb])ps$/)
+  if (!m) return s
+  const [, d, u, b] = m
+  return (+d * 1e3 ** ('KMGT'.indexOf(u) - 1) * 8 ** +(b === 'B')).toFixed()
+}
+
+const TYPE_MAP: Record<string, keyof typeof FROM_URI | undefined> = createPure({
+  http: 'http',
+  https: 'http',
+  socks: 'socks5',
+  socks5: 'socks5',
+  socks5h: 'socks5',
+  'socks5+tls': 'socks5',
+  ss: 'ss',
+  ssr: 'ssr',
+  mieru: 'mieru',
+  mierus: 'mieru',
+  vmess: 'vmess',
+  vless: 'vless',
+  trojan: 'trojan',
+  'trojan-go': 'trojan',
+  hysteria: 'hysteria',
+  hy: 'hysteria',
+  hysteria2: 'hysteria2',
+  hy2: 'hysteria2',
+  tuic: 'tuic',
+  wireguard: 'wireguard',
+  wg: 'wireguard',
+  anytls: 'anytls',
+})
+
+export function fromURI(uri: string, meta = true): Proxy {
+  uri = uri.trim()
+  const _type = uri.split('://')[0].toLowerCase()
+  const type = TYPE_MAP[_type]
+  if (!type || (!meta && !TYPES_OLD_CLASH_SUPPORTED.has(type))) throw Error(`Unsupported type: ${_type}`)
+  const proxy = FROM_URI[type](uri)
+  if (!meta) requireOldClashSupport(proxy)
+  return proxy
+}
+
+export function toURI(proxy: Proxy): string {
+  const type = TYPE_MAP[proxy.type]
+  if (!type) throw Error(`Unsupported type: ${proxy.type}`)
+  return TO_URI[type](proxy)
+}
+
+export function fromURIs(uris: string, meta = true): [Proxy[], number, Record<string, number>] {
+  let total = 0
+  const count_unsupported: Record<string, number> = {}
+  const arr = [
+    ...uris.matchAll(/^([a-z][a-z0-9.+-]*):\/\/.+/gmi).flatMap(([uri, type]) => {
+      total++
+      try {
+        return [fromURI(uri, meta)]
+      } catch {
+        type = type.toLowerCase()
+        type = TYPE_MAP[type] || type
+        count_unsupported[type] = (count_unsupported[type] || 0) + 1
+        return []
+      }
+    }),
+  ]
+  return [
+    arr,
+    total,
+    count_unsupported,
+  ]
+}
+
+export function toURIs(proxies: Proxy[]): string {
+  return proxies.filter((x) => x.type in TYPE_MAP).map(toURI).join('\n')
+}

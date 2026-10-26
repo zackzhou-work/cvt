@@ -1,0 +1,13 @@
+__*
+
+/.vercel
+
+/bin
+/pkg
+
+/node_modules
+/build
+/dist
+/.spin
+/package.json
+/package-lock.json
