@@ -847,21 +847,24 @@ export function fromClash(clash: string, meta = true): [Proxy[], number, Record<
   }
 }
 
+// GEOIP 规则行的末尾（即最后一行 MATCH 规则之前），ndl 模式下在此插入 ,no-resolve
+const RULES_MATCH_INDEX = RULES.lastIndexOf('\n- MATCH,')
+
 function genProxyGroups(all: string[], meta = true) {
   const reject = ['REJECT', ...meta ? ['REJECT-DROP'] : []]
   const map: Record<string, string[]> = {
-    '🇭🇰 ‍香港': [],
-    '🇹🇼 ‍台湾': [],
-    '🇨🇳 ‍中国': [],
-    '🇸🇬 ‍新加坡': [],
-    '🇯🇵 ‍日本': [],
-    '🇺🇸 ‍美国': [],
-    '🎏 ‍其他': [],
+    '香港': [],
+    '台湾': [],
+    '中国': [],
+    '新加坡': [],
+    '日本': [],
+    '美国': [],
+    '其他': [],
   }
   for (const name of all) {
     const flags = name.match(/[🇦-🇿]{2}|🎏/ug)
     if (!flags) {
-      map['🎏 ‍其他'].push(name)
+      map['其他'].push(name)
       continue
     }
     switch (flags[flags.length - 1]) {
@@ -869,41 +872,41 @@ function genProxyGroups(all: string[], meta = true) {
         let i = flags.length
         while (--i > 0 && flags[i] === '🇨🇳');
         if (flags[i] === '🇭🇰') {
-          map['🇭🇰 ‍香港'].push(name)
+          map['香港'].push(name)
         } else if (flags[i] === '🇹🇼') {
-          map['🇹🇼 ‍台湾'].push(name)
+          map['台湾'].push(name)
         }
-        map['🇨🇳 ‍中国'].push(name)
+        map['中国'].push(name)
         break
       }
       case '🇭🇰':
-        map['🇭🇰 ‍香港'].push(name)
-        map['🇨🇳 ‍中国'].push(name)
+        map['香港'].push(name)
+        map['中国'].push(name)
         break
       case '🇹🇼':
-        map['🇹🇼 ‍台湾'].push(name)
-        map['🇨🇳 ‍中国'].push(name)
+        map['台湾'].push(name)
+        map['中国'].push(name)
         break
       case '🇲🇴':
-        map['🇨🇳 ‍中国'].push(name)
+        map['中国'].push(name)
         break
       case '🇸🇬':
-        map['🇸🇬 ‍新加坡'].push(name)
+        map['新加坡'].push(name)
         break
       case '🇯🇵':
-        map['🇯🇵 ‍日本'].push(name)
+        map['日本'].push(name)
         break
       case '🇺🇸':
       case '🇺🇲':
-        map['🇺🇸 ‍美国'].push(name)
+        map['美国'].push(name)
         break
       default:
-        map['🎏 ‍其他'].push(name)
+        map['其他'].push(name)
         break
     }
   }
-  if (map['🇭🇰 ‍香港'].length === map['🇨🇳 ‍中国'].length || map['🇹🇼 ‍台湾'].length === map['🇨🇳 ‍中国'].length) {
-    delete map['🇨🇳 ‍中国']
+  if (map['香港'].length === map['中国'].length || map['台湾'].length === map['中国'].length) {
+    delete map['中国']
   }
   for (const [k, v] of Object.entries(map)) {
     if (v.length === 0) {
@@ -913,7 +916,7 @@ function genProxyGroups(all: string[], meta = true) {
   const entries = Object.entries(map)
   let us_only = false
   if (entries.length === 1) {
-    us_only = entries[0][0] === '🇺🇸 ‍美国'
+    us_only = entries[0][0] === '美国'
     delete map[entries[0][0]]
     entries.pop()
   }
@@ -924,49 +927,49 @@ function genProxyGroups(all: string[], meta = true) {
     url?: string
     interval?: number
     tolerance?: number
-  }[] = [{ name: '✈️ ‍起飞', proxies: [], type: 'select' }]
+  }[] = [{ name: '起飞', proxies: [], type: 'select' }]
   const url = 'https://i.ytimg.com/generate_204'
   const min_interval = 15
   const small_tolerance = 100
   const large_tolerance = 300
   if (all.length) {
     groups.push({
-      name: '⚡ ‍低延迟',
+      name: '低延迟',
       proxies: all,
       type: 'url-test',
       url,
       interval: Math.max(min_interval, all.length),
       tolerance: us_only ? large_tolerance : small_tolerance,
     })
-    groups[0].proxies.push('⚡ ‍低延迟')
-    groups.push({ name: '👆🏻 ‍指定', proxies: all, type: 'select' })
-    groups[0].proxies.push('👆🏻 ‍指定')
+    groups[0].proxies.push('低延迟')
+    groups.push({ name: '指定', proxies: all, type: 'select' })
+    groups[0].proxies.push('指定')
   }
-  groups.push({ name: '🛩️ ‍墙内', proxies: ['DIRECT', ...reject, '✈️ ‍起飞'], type: 'select' })
-  groups.push({ name: '💩 ‍广告', proxies: [...reject, ...meta ? ['PASS'] : [], '🛩️ ‍墙内', '✈️ ‍起飞'], type: 'select' })
+  groups.push({ name: '墙内', proxies: ['DIRECT', ...reject, '起飞'], type: 'select' })
+  groups.push({ name: '广告', proxies: [...reject, ...meta ? ['PASS'] : [], '墙内', '起飞'], type: 'select' })
   groups.push({
-    name: '📺 ‍B站',
+    name: 'B站',
     proxies: [
-      '🛩️ ‍墙内',
-      ...['🇭🇰 ‍香港', '🇹🇼 ‍台湾', '🇨🇳 ‍中国'].filter((x) => x in map),
-      '✈️ ‍起飞',
-      ...['🇭🇰 ‍香港', '🇹🇼 ‍台湾', '🇨🇳 ‍中国'].filter((x) => x in map).map((x) => '👆🏻' + x),
-      ...all.length ? ['👆🏻 ‍指定'] : [],
+      '墙内',
+      ...['香港', '台湾', '中国'].filter((x) => x in map),
+      '起飞',
+      ...['香港', '台湾', '中国'].filter((x) => x in map).map((x) => '指定' + x),
+      ...all.length ? ['指定'] : [],
     ],
     type: 'select',
   })
   groups.push({
-    name: '🤖 ‍AI',
+    name: 'AI',
     proxies: [
-      ...['🇺🇸 ‍美国', '🇹🇼 ‍台湾', '🇸🇬 ‍新加坡', '🇯🇵 ‍日本', '🎏 ‍其他'].filter((x) => x in map),
-      '✈️ ‍起飞',
-      ...['🇺🇸 ‍美国', '🇹🇼 ‍台湾', '🇸🇬 ‍新加坡', '🇯🇵 ‍日本', '🎏 ‍其他'].filter((x) => x in map).map((x) => '👆🏻' + x),
-      ...all.length ? ['👆🏻 ‍指定'] : [],
-      '🛩️ ‍墙内',
+      ...['美国', '台湾', '新加坡', '日本', '其他'].filter((x) => x in map),
+      '起飞',
+      ...['美国', '台湾', '新加坡', '日本', '其他'].filter((x) => x in map).map((x) => '指定' + x),
+      ...all.length ? ['指定'] : [],
+      '墙内',
     ],
     type: 'select',
   })
-  groups.push({ name: '🌐 ‍未知站点', proxies: ['✈️ ‍起飞', '🛩️ ‍墙内', '💩 ‍广告'], type: 'select' })
+  groups.push({ name: '未知站点', proxies: ['起飞', '墙内', '广告'], type: 'select' })
   for (const [k, v] of entries) {
     groups.push({
       name: k,
@@ -974,12 +977,12 @@ function genProxyGroups(all: string[], meta = true) {
       type: 'url-test',
       url,
       interval: Math.max(min_interval, v.length),
-      tolerance: k === '🇺🇸 ‍美国' ? large_tolerance : small_tolerance,
+      tolerance: k === '美国' ? large_tolerance : small_tolerance,
     })
     groups[0].proxies.push(k)
   }
   for (const [k, v] of entries) {
-    const name = '👆🏻' + k
+    const name = '指定' + k
     groups.push({ name, proxies: v, type: 'select' })
     groups[0].proxies.push(name)
   }
@@ -1041,6 +1044,6 @@ export function toClash(
     ...proxies.map((x) => `- ${JSON.stringify(x)}\n`),
     'proxy-groups:\n',
     ...genProxyGroups(nonHiddenProxies, meta).map((x) => `- ${JSON.stringify(x)}\n`),
-    ...!ndl ? [RULES] : [RULES.slice(0, -18), ',no-resolve', RULES.slice(-18)],
+    ...!ndl ? [RULES] : [RULES.slice(0, RULES_MATCH_INDEX), ',no-resolve', RULES.slice(RULES_MATCH_INDEX)],
   ].join('')
 }
